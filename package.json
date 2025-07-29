@@ -2,6 +2,6 @@
   "name": "nimenhuuto-api",
   "version": "1.0.0",
   "dependencies": {
-    "ical": "^0.15.0"
+    "ical": "^0.14.0"
   }
 }
