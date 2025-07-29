@@ -1,4 +1,4 @@
-import ical from "ical";
+import ical from "node-ical";
 import https from "https";
 
 export default async function handler(req, res) {

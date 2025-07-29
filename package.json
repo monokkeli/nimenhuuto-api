@@ -1,7 +1,8 @@
 {
   "name": "nimenhuuto-api",
   "version": "1.0.0",
+  "type": "module",
   "dependencies": {
-    "ical": "^0.14.0"
+    "node-ical": "^0.15.0"
   }
 }
