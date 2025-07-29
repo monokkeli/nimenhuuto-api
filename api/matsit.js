@@ -9,18 +9,19 @@ export default async function handler(req, res) {
     const parsed = ical.parseICS(data);
 
     const nyt = new Date();
-    const matsit = Object.values(parsed)
+    const tapahtumat = Object.values(parsed)
       .filter((e) => e.type === "VEVENT")
-      .filter((e) => e.summary?.toLowerCase().includes("matsi"))
       .filter((e) => new Date(e.start) > nyt)
       .sort((a, b) => new Date(a.start) - new Date(b.start))
       .map((e) => ({
         alku: e.start,
         nimi: e.summary,
+        kuvaus: e.description ?? "",
+        sijainti: e.location ?? "",
       }));
 
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.status(200).json(matsit);
+    res.status(200).json(tapahtumat);
   } catch (err) {
     console.error("Virhe iCal-haussa:", err);
     res.status(500).json({ virhe: "Virhe haettaessa iCal-dataa" });
