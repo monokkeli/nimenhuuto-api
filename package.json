@@ -1,0 +1,7 @@
+{
+  "name": "nimenhuuto-api",
+  "version": "1.0.0",
+  "dependencies": {
+    "ical": "^0.15.0"
+  }
+}
