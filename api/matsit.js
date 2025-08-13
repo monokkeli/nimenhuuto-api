@@ -5,11 +5,12 @@ import https from "https";
 /**
  * Yhdistetty Nimenhuuto-proxy:
  * - Lataa kaikki kolme kalenteria rinnakkain
- * - Suodattaa vain tulevat tapahtumat
+ * - Suodattaa VAIN tulevat TAPAHTUMAT, jotka näyttävät otteluilta:
+ *    * (nimen etuliite poistettu) sisältää "hpv" JA "-"
  * - Palauttaa yhteisen listan aikajärjestyksessä
  *
- * HUOM: Tapahtuman nimi säilytetään alkuperäisenä (esim. "HPV Jääkiekko: HPV - Vihu"),
- * jotta frontti voi päätellä lajin nimen etuliitteen perusteella.
+ * HUOM: SUMMARY säilytetään sellaisenaan vastauksessa (esim. "HPV Jääkiekko: HPV - Vihu"),
+ * mutta suodatus tehdään etuliitteen poiston jälkeen.
  */
 export default async function handler(req, res) {
   // Salli CORS
@@ -28,18 +29,26 @@ export default async function handler(req, res) {
     // Hae kaikki kalenterit rinnakkain
     const icsStrings = await Promise.all(SOURCES.map(fetchWithHttps));
 
-    // Jäsennä ja kerää tapahtumat
     const nyt = new Date();
+
+    // Pieni apufunktio: poista mahdollinen "Jotain: " -etuliite
+    const stripPrefix = (txt = "") => txt.replace(/^[^:]+:\s*/, "");
+
+    // Jäsennä, rakenna ja SUODATA vain ottelut (hpv + viiva)
     const kaikkiTapahtumat = icsStrings.flatMap((data) => {
       const parsed = ical.parseICS(data);
       return Object.values(parsed)
         .filter((e) => e.type === "VEVENT")
         .map((e) => ({
-          alku: e.start,
-          nimi: e.summary,             // esim. "HPV Jääkiekko: HPV - Vihu"
-          kuvaus: e.description ?? "", // esim. Nimenhuuto-linkki
-          sijainti: e.location ?? "",
-        }));
+          alku: e.start,                 // DTSTART
+          nimi: e.summary,               // SUMMARY (säilytetään alkuperäisenä)
+          kuvaus: e.description ?? "",   // DESCRIPTION (sis. usein linkin)
+          sijainti: e.location ?? "",    // LOCATION
+        }))
+        .filter((evt) => {
+          const n = stripPrefix(evt.nimi || "").toLowerCase();
+          return n.includes("hpv") && n.includes("-"); // ← vain ottelut
+        });
     });
 
     // Vain tulevat ja aikajärjestykseen
