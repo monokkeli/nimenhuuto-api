@@ -4,59 +4,45 @@ import https from "https";
 
 /**
  * Yhdistetty Nimenhuuto-proxy:
- * - Hakee KOLME kalenteria rinnakkain
- * - Lisää jokaiselle tapahtumalle kentän `laji`: "jääkiekko" | "salibandy" | "jalkapallo"
- * - Suodattaa vain tulevat tapahtumat ja lajittelee aikajärjestykseen
- * - Säilyttää SUMMARY/DESCRIPTION/LOCATION → mapattuna: nimi/kuvaus/sijainti
+ * - Lataa kaikki kolme kalenteria rinnakkain
+ * - Suodattaa vain tulevat tapahtumat
+ * - Palauttaa yhteisen listan aikajärjestyksessä
  *
- * Frontti voi tämän jälkeen suodattaa pelkällä: e.laji === valittuLaji
+ * HUOM: Tapahtuman nimi säilytetään alkuperäisenä (esim. "HPV Jääkiekko: HPV - Vihu"),
+ * jotta frontti voi päätellä lajin nimen etuliitteen perusteella.
  */
 export default async function handler(req, res) {
-  // CORS
+  // Salli CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // Lähteet + laji
   const SOURCES = [
-    {
-      url: "https://hpvjaakiekko.nimenhuuto.com/calendar/ical",
-      laji: "jääkiekko",
-    },
-    {
-      url: "https://hpvsalibandy.nimenhuuto.com/calendar/ical",
-      laji: "salibandy",
-    },
-    {
-      url: "https://testihpv.nimenhuuto.com/calendar/ical", // testit jalkapalloon
-      laji: "jalkapallo",
-    },
+    "https://hpvjaakiekko.nimenhuuto.com/calendar/ical", // HPV Jääkiekko
+    "https://hpvsalibandy.nimenhuuto.com/calendar/ical", // HPV Salibandy
+    "https://testihpv.nimenhuuto.com/calendar/ical",     // Testi HPV (jalkapallon testit)
   ];
 
   try {
-    // Hae kaikki ICS:t rinnakkain
-    const icsStrings = await Promise.all(SOURCES.map((s) => fetchWithHttps(s.url)));
+    // Hae kaikki kalenterit rinnakkain
+    const icsStrings = await Promise.all(SOURCES.map(fetchWithHttps));
 
+    // Jäsennä ja kerää tapahtumat
     const nyt = new Date();
-
-    // Parsitaan ja liitetään `laji` lähteen perusteella
-    const kaikkiTapahtumat = icsStrings.flatMap((data, idx) => {
+    const kaikkiTapahtumat = icsStrings.flatMap((data) => {
       const parsed = ical.parseICS(data);
-      const laji = SOURCES[idx].laji;
-
       return Object.values(parsed)
         .filter((e) => e.type === "VEVENT")
         .map((e) => ({
-          alku: e.start,                 // DTSTART
-          nimi: e.summary,               // SUMMARY (esim. "HPV Jääkiekko: HPV - Vihu")
-          kuvaus: e.description ?? "",   // DESCRIPTION (sisältää usein linkin)
-          sijainti: e.location ?? "",    // LOCATION
-          laji,                          // <- lisätty
+          alku: e.start,
+          nimi: e.summary,             // esim. "HPV Jääkiekko: HPV - Vihu"
+          kuvaus: e.description ?? "", // esim. Nimenhuuto-linkki
+          sijainti: e.location ?? "",
         }));
     });
 
-    // Vain tulevat & järjestä
+    // Vain tulevat ja aikajärjestykseen
     const tulevat = kaikkiTapahtumat
       .filter((e) => new Date(e.alku) > nyt)
       .sort((a, b) => new Date(a.alku) - new Date(b.alku));
