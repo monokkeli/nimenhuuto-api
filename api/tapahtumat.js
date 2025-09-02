@@ -4,18 +4,21 @@ import https from "https";
 
 /**
  * /api/tapahtumat
- * Palauttaa tulevat tapahtumat valitulle lajille. Luokittelee ottelut vs. muut.
- * Toistuvista tapahtumista palautetaan vain seuraava esiintymä (UID-ryhmittely).
+ * Palauttaa tulevat tapahtumat valitulle lajille.
+ * - Näyttää KAIKKI tapahtumat seuraavan kuukauden ajalta (myös toistuvat).
+ * - Toistuvista sarjoista generoidaan kaikki esiintymät aikaväliin [nyt, nyt+1 kk].
+ * - EXDATE-poikkeukset ohitetaan.
+ * - RECURRENCE-ID (override) korvaa masterin tiedot kyseiselle esiintymälle.
  *
  * Kyselyparametrit:
  *   - laji=jaakiekko|salibandy|jalkapallo (oletus: jaakiekko)
  *   - tyyppi=kaikki|ottelut|muut (oletus: kaikki)
  *
- * Palautetut kentät (per tapahtuma):
- *   - alku: ISO-aika (seuraavan esiintymän alkamishetki)
- *   - nimi: alkuperäinen SUMMARY (prefix säilytetty)
+ * Palautetut kentät:
+ *   - alku: ISO-aika
+ *   - nimi: SUMMARY (prefix säilytetty)
  *   - visibleName: SUMMARY ilman "Xxx: " -etuliitettä
- *   - kuvaus: DESCRIPTION (usein linkki)
+ *   - kuvaus: DESCRIPTION
  *   - sijainti: LOCATION
  *   - eventType: "ottelu" | "muu"
  *   - subType: "ottelu" | "turnaus" | "treenit" | "viihde" | "muu"
@@ -46,12 +49,16 @@ export default async function handler(req, res) {
 
   try {
     const icsStrings = await Promise.all(SOURCES.map(fetchWithHttps));
-    const nyt = new Date();
 
-    // Etuliitteen poisto (esim. "HPV Jääkiekko: ")
+    // Aikaikkuna: nyt ... nyt + 1 kuukausi
+    const nyt = new Date();
+    const windowStart = nyt;
+    const windowEnd = new Date(nyt);
+    windowEnd.setMonth(windowEnd.getMonth() + 1);
+
+    // Apurit
     const stripPrefix = (txt = "") => txt.replace(/^[^:]+:\s*/, "");
 
-    // Pieni helper toistuvien exdate-poikkeamien ohitukseen
     const isExcluded = (evt, dt) => {
       if (!evt?.exdate) return false;
       return Object.values(evt.exdate).some((ex) => {
@@ -60,7 +67,6 @@ export default async function handler(req, res) {
       });
     };
 
-    // Kategorisointi (järjestys ratkaisee)
     const classify = (visibleName) => {
       const n = (visibleName || "").toLowerCase();
 
@@ -71,11 +77,11 @@ export default async function handler(req, res) {
       // 2) Turnaus
       if (/turnaus/.test(n)) return { eventType: "muu", subType: "turnaus" };
 
-      // 3) Treenit — joustava juuritunnistus (treeni|reeni|harjoit|harkat|harkka)
+      // 3) Treenit — joustava juuritunnistus
       if (/(treeni|reeni|harjoit|harkat|harkka)/.test(n))
         return { eventType: "muu", subType: "treenit" };
 
-      // 4) Viihde: sauna, laiva, risteily, virkistys
+      // 4) Viihde
       if (/(sauna|laiva|risteily|virkistys)/.test(n))
         return { eventType: "muu", subType: "viihde" };
 
@@ -83,16 +89,16 @@ export default async function handler(req, res) {
       return { eventType: "muu", subType: "muu" };
     };
 
-    // Kerätään seuraava esiintymä per UID
-    const nextByUID = new Map();
-
-    // Kerätään override-instanssit talteen (RECURRENCE-ID)
+    // Kerätään override-instanssit (RECURRENCE-ID)
+    // Map: uid -> Map(recurrenceTimeMs -> overrideEvent)
     const overridesByUID = new Map();
+
+    const allItems = [];
 
     for (const data of icsStrings) {
       const parsed = ical.parseICS(data);
 
-      // Ensimmäinen läpikäynti: tallenna override-instanssit (RECURRENCE-ID)
+      // 1) Kerää override-instanssit talteen
       for (const key of Object.keys(parsed)) {
         const e = parsed[key];
         if (!e || e.type !== "VEVENT") continue;
@@ -106,81 +112,99 @@ export default async function handler(req, res) {
         }
       }
 
-      // Toinen läpikäynti: käsittele vain masterit (ja yksittäiset)
+      // 2) Generoi aikavälin esiintymät (masterit ja yksittäiset)
       for (const key of Object.keys(parsed)) {
         const e = parsed[key];
         if (!e || e.type !== "VEVENT") continue;
 
-        // Ohita override-instanssit
+        // Ohita override-instanssit – ne haetaan overridesByUID:stä esiintymähetkellä
         if (e.recurrenceid) continue;
 
-        const originalStart =
-          e.start instanceof Date ? e.start : e.start ? new Date(e.start) : null;
         const hasRRule = !!e.rrule;
-
-        // Laske seuraava esiintymä vain masterille
-        let nextStart = null;
-        let sourceForFields = e;
+        const uid = e.uid || `${e.summary}-${e.start?.toISOString?.() || ""}`;
 
         if (hasRRule && e.rrule) {
-          let candidate = e.rrule.after(nyt, true);
-          let guard = 0;
-          while (candidate && isExcluded(e, candidate) && guard < 20) {
-            candidate = e.rrule.after(candidate, false);
-            guard++;
-          }
-          if (candidate && candidate > nyt) {
-            const uid = e.uid || "";
-            const overrides = overridesByUID.get(uid);
-            if (overrides) {
-              const ov = overrides.get(candidate.getTime());
+          // Generoi kaikki esiintymät ikkunaan
+          // Huom: kolmas parametri 'inc' = true, sisällytetään rajahetket
+          const occurrences = e.rrule.between(windowStart, windowEnd, true);
+
+          for (let occ of occurrences) {
+            if (!(occ instanceof Date)) occ = new Date(occ);
+            // Ohita EXDATE
+            if (isExcluded(e, occ)) continue;
+
+            // Override tälle esiintymälle?
+            let sourceForFields = e;
+            const ovMap = overridesByUID.get(uid);
+            if (ovMap) {
+              const ov = ovMap.get(occ.getTime());
               if (ov) {
                 sourceForFields = ov;
-                if (ov.start instanceof Date) {
-                  candidate = ov.start;
-                } else if (ov.start) {
-                  candidate = new Date(ov.start);
-                }
               }
             }
-            nextStart = candidate;
+
+            // Valitse alkuhetki
+            let start = occ;
+            if (sourceForFields !== e) {
+              // override saattaa siirtää alkua
+              if (sourceForFields.start instanceof Date) start = sourceForFields.start;
+              else if (sourceForFields.start) start = new Date(sourceForFields.start);
+            }
+
+            // Varmista että on ikkunassa (esim. override siirtänyt aikaa)
+            if (start < windowStart || start > windowEnd) continue;
+
+            const name = sourceForFields.summary || e.summary || "";
+            const visibleName = stripPrefix(name);
+            const { eventType, subType } = classify(visibleName);
+
+            // Tyyppisuodatus
+            if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
+            if (tyyppi === "muut" && eventType !== "muu") continue;
+
+            allItems.push({
+              alkuDate: start,
+              alku: start.toISOString(),
+              nimi: name,
+              visibleName,
+              kuvaus: sourceForFields.description || e.description || "",
+              sijainti: sourceForFields.location || e.location || "",
+              eventType,
+              subType,
+              isRecurring: true,
+            });
           }
         } else {
-          if (originalStart && originalStart > nyt) nextStart = originalStart;
-        }
+          // Ei toistuva: lisää jos on ikkunassa
+          const start =
+            e.start instanceof Date ? e.start : e.start ? new Date(e.start) : null;
+          if (!start) continue;
+          if (start < windowStart || start > windowEnd) continue;
 
-        if (!nextStart) continue;
+          const name = e.summary || "";
+          const visibleName = stripPrefix(name);
+          const { eventType, subType } = classify(visibleName);
 
-        const uid = e.uid || `${e.summary}-${e.start?.toISOString?.() || ""}`;
-        const name = sourceForFields.summary || e.summary || "";
-        const visibleName = stripPrefix(name);
+          if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
+          if (tyyppi === "muut" && eventType !== "muu") continue;
 
-        const { eventType, subType } = classify(visibleName);
-
-        if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
-        if (tyyppi === "muut" && eventType !== "muu") continue;
-
-        const kuvaus = sourceForFields.description || e.description || "";
-        const sijainti = sourceForFields.location || e.location || "";
-
-        const prev = nextByUID.get(uid);
-        if (!prev || nextStart < prev.alkuDate) {
-          nextByUID.set(uid, {
-            alkuDate: nextStart,
-            alku: nextStart.toISOString(),
+          allItems.push({
+            alkuDate: start,
+            alku: start.toISOString(),
             nimi: name,
             visibleName,
-            kuvaus,
-            sijainti,
+            kuvaus: e.description || "",
+            sijainti: e.location || "",
             eventType,
             subType,
-            isRecurring: hasRRule, // <- uusi kenttä
+            isRecurring: false,
           });
         }
       }
     }
 
-    const tulos = Array.from(nextByUID.values())
+    // Järjestä ajankohdan mukaan ja pudota tekninen kenttä pois
+    const tulos = allItems
       .sort((a, b) => a.alkuDate - b.alkuDate)
       .map(({ alkuDate, ...rest }) => rest);
 
