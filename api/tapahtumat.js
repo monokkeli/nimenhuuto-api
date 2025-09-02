@@ -18,7 +18,7 @@ import https from "https";
  *   - kuvaus: DESCRIPTION (usein linkki)
  *   - sijainti: LOCATION
  *   - eventType: "ottelu" | "muu"
- *   - subType: esim. "treeni" | "turnaus" | "ilmoittautuminen" | "muu"
+ *   - subType: "ottelu" | "turnaus" | "treenit" | "viihde" | "muu"
  *   - isRecurring: boolean
  */
 export default async function handler(req, res) {
@@ -54,27 +54,32 @@ export default async function handler(req, res) {
     // Pieni helper toistuvien exdate-poikkeamien ohitukseen
     const isExcluded = (evt, dt) => {
       if (!evt?.exdate) return false;
-      // node-ical exdate on olio jonka avaimet ovat Date-tyyppisinä tai isoina merkkijonoina
-      // Verrataan päivämäärän aikaleimoja (päivän tarkkuus ei riitä, käytetään täyttä aikaa).
       return Object.values(evt.exdate).some((ex) => {
         const exDate = ex instanceof Date ? ex : new Date(ex);
         return exDate.getTime() === dt.getTime();
       });
     };
 
-    // Määritetään tyyppi & alityyppi nimen perusteella (heuristiikka)
+    // UUSI: Kategorisointi (järjestys ratkaisee)
     const classify = (visibleName) => {
       const n = (visibleName || "").toLowerCase();
 
-      // Ottelu: hpv + viiva
+      // 1) Ottelu: hpv + viiva
       const isMatch = n.includes("hpv") && n.includes("-");
       if (isMatch) return { eventType: "ottelu", subType: "ottelu" };
 
-      // Alityypit muihin
-      if (/(treeni|harjoit)/.test(n)) return { eventType: "muu", subType: "treeni" };
+      // 2) Turnaus
       if (/turnaus/.test(n)) return { eventType: "muu", subType: "turnaus" };
-      if (/ilmoittautum/.test(n)) return { eventType: "muu", subType: "ilmoittautuminen" };
 
+      // 3) Treenit: reeni, harkat, harkka
+      if (/(^|\s)(reeni|harkat|harkka)(\s|$)/.test(n))
+        return { eventType: "muu", subType: "treenit" };
+
+      // 4) Viihde: sauna, laiva, risteily, virkistys
+      if (/(sauna|laiva|risteily|virkistys)/.test(n))
+        return { eventType: "muu", subType: "viihde" };
+
+      // 5) Muu
       return { eventType: "muu", subType: "muu" };
     };
 
@@ -95,21 +100,15 @@ export default async function handler(req, res) {
         let nextStart = null;
 
         if (hasRRule && e.rrule) {
-          // Hae seuraava esiintymä 'nyt' jälkeen, ohita exdate't
           let candidate = e.rrule.after(nyt, true);
           let guard = 0;
           while (candidate && isExcluded(e, candidate) && guard < 10) {
             candidate = e.rrule.after(candidate, false);
             guard++;
           }
-          if (candidate && candidate > nyt) {
-            nextStart = candidate;
-          }
+          if (candidate && candidate > nyt) nextStart = candidate;
         } else {
-          // Ei toistuva -> kelpaa vain tulevaisuuteen sijoittuva
-          if (originalStart && originalStart > nyt) {
-            nextStart = originalStart;
-          }
+          if (originalStart && originalStart > nyt) nextStart = originalStart;
         }
 
         if (!nextStart) continue;
@@ -124,7 +123,6 @@ export default async function handler(req, res) {
         if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
         if (tyyppi === "muut" && eventType !== "muu") continue;
 
-        // Tallenna pienin (lähin tuleva) nextStart per UID
         const prev = nextByUID.get(uid);
         if (!prev || nextStart < prev.alkuDate) {
           nextByUID.set(uid, {
@@ -142,10 +140,9 @@ export default async function handler(req, res) {
       }
     }
 
-    // Muunna listaksi, järjestä aikajärjestykseen
     const tulos = Array.from(nextByUID.values())
       .sort((a, b) => a.alkuDate - b.alkuDate)
-      .map(({ alkuDate, ...rest }) => rest); // pudota Date-apukenttä
+      .map(({ alkuDate, ...rest }) => rest);
 
     return res.status(200).json(tulos);
   } catch (err) {
