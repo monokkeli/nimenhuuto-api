@@ -72,7 +72,6 @@ export default async function handler(req, res) {
       if (/turnaus/.test(n)) return { eventType: "muu", subType: "turnaus" };
 
       // 3) Treenit — joustava juuritunnistus (treeni|reeni|harjoit|harkat|harkka)
-      //    Esim. futisreenit, futistreeni, harjoitukset, harkkapeli...
       if (/(treeni|reeni|harjoit|harkat|harkka)/.test(n))
         return { eventType: "muu", subType: "treenit" };
 
@@ -84,30 +83,68 @@ export default async function handler(req, res) {
       return { eventType: "muu", subType: "muu" };
     };
 
-    // Parsitaan ja poimitaan seuraava esiintymä per UID
+    // Kerätään seuraava esiintymä per UID
     const nextByUID = new Map();
+
+    // Kerätään override-instanssit talteen (RECURRENCE-ID)
+    const overridesByUID = new Map();
 
     for (const data of icsStrings) {
       const parsed = ical.parseICS(data);
 
+      // Ensimmäinen läpikäynti: tallenna override-instanssit (RECURRENCE-ID)
+      for (const key of Object.keys(parsed)) {
+        const e = parsed[key];
+        if (!e || e.type !== "VEVENT") continue;
+        if (e.recurrenceid) {
+          const uid = e.uid;
+          if (!uid) continue;
+          const rid = e.recurrenceid instanceof Date ? e.recurrenceid : new Date(e.recurrenceid);
+          const ms = rid.getTime();
+          if (!overridesByUID.has(uid)) overridesByUID.set(uid, new Map());
+          overridesByUID.get(uid).set(ms, e);
+        }
+      }
+
+      // Toinen läpikäynti: käsittele vain masterit (ja yksittäiset)
       for (const key of Object.keys(parsed)) {
         const e = parsed[key];
         if (!e || e.type !== "VEVENT") continue;
 
-        const originalStart = e.start instanceof Date ? e.start : new Date(e.start);
+        // Ohita override-instanssit
+        if (e.recurrenceid) continue;
+
+        const originalStart =
+          e.start instanceof Date ? e.start : e.start ? new Date(e.start) : null;
         const hasRRule = !!e.rrule;
 
-        // Laske seuraava esiintymä:
+        // Laske seuraava esiintymä vain masterille
         let nextStart = null;
+        let sourceForFields = e;
 
         if (hasRRule && e.rrule) {
           let candidate = e.rrule.after(nyt, true);
           let guard = 0;
-          while (candidate && isExcluded(e, candidate) && guard < 10) {
+          while (candidate && isExcluded(e, candidate) && guard < 20) {
             candidate = e.rrule.after(candidate, false);
             guard++;
           }
-          if (candidate && candidate > nyt) nextStart = candidate;
+          if (candidate && candidate > nyt) {
+            const uid = e.uid || "";
+            const overrides = overridesByUID.get(uid);
+            if (overrides) {
+              const ov = overrides.get(candidate.getTime());
+              if (ov) {
+                sourceForFields = ov;
+                if (ov.start instanceof Date) {
+                  candidate = ov.start;
+                } else if (ov.start) {
+                  candidate = new Date(ov.start);
+                }
+              }
+            }
+            nextStart = candidate;
+          }
         } else {
           if (originalStart && originalStart > nyt) nextStart = originalStart;
         }
@@ -115,14 +152,16 @@ export default async function handler(req, res) {
         if (!nextStart) continue;
 
         const uid = e.uid || `${e.summary}-${e.start?.toISOString?.() || ""}`;
-        const name = e.summary || "";
+        const name = sourceForFields.summary || e.summary || "";
         const visibleName = stripPrefix(name);
 
         const { eventType, subType } = classify(visibleName);
 
-        // Tyyppisuodatus (tyyppi=ottelut|muut)
         if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
         if (tyyppi === "muut" && eventType !== "muu") continue;
+
+        const kuvaus = sourceForFields.description || e.description || "";
+        const sijainti = sourceForFields.location || e.location || "";
 
         const prev = nextByUID.get(uid);
         if (!prev || nextStart < prev.alkuDate) {
@@ -131,11 +170,11 @@ export default async function handler(req, res) {
             alku: nextStart.toISOString(),
             nimi: name,
             visibleName,
-            kuvaus: e.description || "",
-            sijainti: e.location || "",
+            kuvaus,
+            sijainti,
             eventType,
             subType,
-            isRecurring: hasRRule,
+            isRecurring: hasRRule, // <- uusi kenttä
           });
         }
       }
