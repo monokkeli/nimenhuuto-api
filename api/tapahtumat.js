@@ -60,7 +60,7 @@ export default async function handler(req, res) {
       });
     };
 
-    // UUSI: Kategorisointi (järjestys ratkaisee)
+    // Kategorisointi (järjestys ratkaisee)
     const classify = (visibleName) => {
       const n = (visibleName || "").toLowerCase();
 
@@ -71,8 +71,9 @@ export default async function handler(req, res) {
       // 2) Turnaus
       if (/turnaus/.test(n)) return { eventType: "muu", subType: "turnaus" };
 
-      // 3) Treenit: reeni, harkat, harkka
-      if (/(^|\s)(reeni|harkat|harkka)(\s|$)/.test(n))
+      // 3) Treenit — joustava juuritunnistus (treeni|reeni|harjoit|harkat|harkka)
+      //    Esim. futisreenit, futistreeni, harjoitukset, harkkapeli...
+      if (/(treeni|reeni|harjoit|harkat|harkka)/.test(n))
         return { eventType: "muu", subType: "treenit" };
 
       // 4) Viihde: sauna, laiva, risteily, virkistys
