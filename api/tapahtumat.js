@@ -14,7 +14,7 @@ import https from "https";
  *   - laji=jaakiekko|salibandy|jalkapallo (oletus: jaakiekko)
  *   - tyyppi=kaikki|ottelut|muut (oletus: kaikki)
  *
- * Palautetut kentät:
+ * Palautetut kentät (uusia lisätty otteluille):
  *   - alku: ISO-aika
  *   - nimi: SUMMARY (prefix säilytetty)
  *   - visibleName: SUMMARY ilman "Xxx: " -etuliitettä
@@ -23,6 +23,10 @@ import https from "https";
  *   - eventType: "ottelu" | "muu"
  *   - subType: "ottelu" | "turnaus" | "treenit" | "viihde" | "muu"
  *   - isRecurring: boolean
+ *   - home_team_name (uusi, vain otteluille)
+ *   - away_team_name (uusi, vain otteluille)
+ *   - home_is_ours: boolean (uusi, vain otteluille)
+ *   - opponent_team_name (uusi, vain otteluille)
  */
 export default async function handler(req, res) {
   // CORS
@@ -39,13 +43,12 @@ export default async function handler(req, res) {
   const SOURCES_BY_LAJI = {
     "jääkiekko": ["https://hpvjaakiekko.nimenhuuto.com/calendar/ical"],
     "jaakiekko": ["https://hpvjaakiekko.nimenhuuto.com/calendar/ical"],
-    "salibandy": ["https://hpvsalibandy.nimenhuuto.com/calendar/ical"],
-    "jalkapallo": ["https://testihpv.nimenhuuto.com/calendar/ical"],
+    salibandy: ["https://hpvsalibandy.nimenhuuto.com/calendar/ical"],
+    jalkapallo: ["https://testihpv.nimenhuuto.com/calendar/ical"],
   };
 
   const SOURCES =
-    SOURCES_BY_LAJI[laji] ||
-    SOURCES_BY_LAJI["jääkiekko"]; // fallback jääkiekkoon
+    SOURCES_BY_LAJI[laji] || SOURCES_BY_LAJI["jääkiekko"]; // fallback jääkiekkoon
 
   try {
     const icsStrings = await Promise.all(SOURCES.map(fetchWithHttps));
@@ -56,7 +59,7 @@ export default async function handler(req, res) {
     const windowEnd = new Date(nyt);
     windowEnd.setMonth(windowEnd.getMonth() + 1);
 
-    // Apurit
+    // --- Apurit ---
     const stripPrefix = (txt = "") => txt.replace(/^[^:]+:\s*/, "");
 
     const isExcluded = (evt, dt) => {
@@ -67,25 +70,150 @@ export default async function handler(req, res) {
       });
     };
 
+    /**
+     * Siivoa otsikko: yhtenäistä viivat, kutista välit, trimmaa.
+     */
+    const cleanTitle = (raw = "") =>
+      raw
+        .replace(/[–—]/g, "-")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    /**
+     * Parsii joukkueet otsikosta HPV-ankkurilla.
+     * Oletus: toinen joukkue on aina pelkkä "HPV" (kirjainkoolla ei väliä).
+     * Hyväksyy viivan ilman välilyöntejä (esim. "team-HPV" tai "HPV-opponentti").
+     * Palauttaa:
+     *   { home_team_name, away_team_name, home_is_ours, opponent_team_name }
+     * tai null jos ei varma ottelu.
+     */
+    function parseTeamsFromTitle(titleRaw = "") {
+      if (!titleRaw) return null;
+
+      const title = cleanTitle(titleRaw);
+      const lower = title.toLowerCase();
+
+      // Etsi "hpv" sanana (sallitaan rajat: alku/loppu/ei-aakkosnumeerinen)
+      const hpvRegex = /(^|[^a-z0-9äöå])hpv([^a-z0-9äöå]|$)/i;
+      const m = lower.match(hpvRegex);
+      if (!m) return null;
+
+      // Selvitä HPV:n indeksi alkuperäisessä merkkijonossa:
+      // match.index osoittaa "ennen-ryhmän" alkuun; etsitään varsinainen "hpv".
+      // Etsitään ensimmäinen "hpv" case-insensitiivisesti.
+      const hpvWordMatch = title.match(/hpv/i);
+      if (!hpvWordMatch) return null;
+      const hpvStart = hpvWordMatch.index;
+      const hpvEnd = hpvStart + hpvWordMatch[0].length;
+
+      // Etsi lähin viiva heti HPV:n vasemmalta tai oikealta (sallitaan valinnainen välilyönti)
+      // Vasemman puolen viiva: ..."-"HPV tai ..." - "HPV
+      let leftDashIdx = -1;
+      for (let i = hpvStart - 1; i >= 0; i--) {
+        const ch = title[i];
+        if (ch === " ") continue;
+        if (ch === "-") {
+          leftDashIdx = i;
+        }
+        break;
+      }
+
+      // Oikean puolen viiva: HPV"-"... tai HPV" - "
+      let rightDashIdx = -1;
+      for (let i = hpvEnd; i < title.length; i++) {
+        const ch = title[i];
+        if (ch === " ") continue;
+        if (ch === "-") {
+          rightDashIdx = i;
+        }
+        break;
+      }
+
+      // Jos ei viivaa aivan kyljessä, hyväksytään vielä " vs " / " v " erottimena
+      // mutta vain jos molemmilla puolilla on tekstiä.
+      const vsRegex = /\s(vs|v)\s/i;
+      const hasVs = vsRegex.test(title);
+
+      if (leftDashIdx === -1 && rightDashIdx === -1 && !hasVs) {
+        return null; // ei näytä ottelulta
+      }
+
+      // Valitse ensisijainen erotin: viiva lähellä HPV:tä, muutoin "vs"
+      if (leftDashIdx !== -1) {
+        // Muoto: OPPONENTTI - HPV
+        const opponent = title.slice(0, leftDashIdx).trim();
+        if (!opponent) return null;
+        return {
+          home_team_name: opponent,
+          away_team_name: "HPV",
+          home_is_ours: false,
+          opponent_team_name: opponent,
+        };
+      }
+      if (rightDashIdx !== -1) {
+        // Muoto: HPV - OPPONENTTI
+        const opponent = title.slice(rightDashIdx + 1).trim();
+        if (!opponent) return null;
+        return {
+          home_team_name: "HPV",
+          away_team_name: opponent,
+          home_is_ours: true,
+          opponent_team_name: opponent,
+        };
+      }
+
+      if (hasVs) {
+        // "HPV vs OPP" tai "OPP vs HPV" → päättele HPV:n sijainnin mukaan
+        const parts = title.split(vsRegex);
+        // split palauttaa myös erotinryhmän; suodatetaan tyhjät.
+        const tokens = title.split(/\s(?:vs|v)\s/i);
+        if (tokens.length === 2) {
+          const [p1, p2] = tokens.map((t) => t.trim());
+          if (!p1 || !p2) return null;
+          if (/^hpv$/i.test(p1)) {
+            return {
+              home_team_name: "HPV",
+              away_team_name: p2,
+              home_is_ours: true,
+              opponent_team_name: p2,
+            };
+          }
+          if (/^hpv$/i.test(p2)) {
+            return {
+              home_team_name: p1,
+              away_team_name: "HPV",
+              home_is_ours: false,
+              opponent_team_name: p1,
+            };
+          }
+        }
+      }
+
+      return null;
+    }
+
+    /**
+     * Luokittelee tapahtuman. Käyttää yllä olevaa parseria ottelun tunnistukseen.
+     */
     const classify = (visibleName) => {
-      const n = (visibleName || "").toLowerCase();
+      const cleaned = cleanTitle(visibleName || "");
+      const parsed = parseTeamsFromTitle(cleaned);
+      if (parsed) return { eventType: "ottelu", subType: "ottelu", parsed };
 
-      // 1) Ottelu: hpv + viiva
-      const isMatch = n.includes("hpv") && n.includes("-");
-      if (isMatch) return { eventType: "ottelu", subType: "ottelu" };
+      const n = cleaned.toLowerCase();
 
-      // 2) Turnaus
+      // Turnaus
       if (/turnaus/.test(n)) return { eventType: "muu", subType: "turnaus" };
 
-      // 3) Treenit — joustava juuritunnistus
+      // Treenit — joustava juuritunnistus
       if (/(treeni|reeni|harjoit|harkat|harkka)/.test(n))
         return { eventType: "muu", subType: "treenit" };
 
-      // 4) Viihde
+      // Viihde
       if (/(sauna|laiva|risteily|virkistys)/.test(n))
         return { eventType: "muu", subType: "viihde" };
 
-      // 5) Muu
+      // Muu
       return { eventType: "muu", subType: "muu" };
     };
 
@@ -105,7 +233,8 @@ export default async function handler(req, res) {
         if (e.recurrenceid) {
           const uid = e.uid;
           if (!uid) continue;
-          const rid = e.recurrenceid instanceof Date ? e.recurrenceid : new Date(e.recurrenceid);
+          const rid =
+            e.recurrenceid instanceof Date ? e.recurrenceid : new Date(e.recurrenceid);
           const ms = rid.getTime();
           if (!overridesByUID.has(uid)) overridesByUID.set(uid, new Map());
           overridesByUID.get(uid).set(ms, e);
@@ -125,7 +254,6 @@ export default async function handler(req, res) {
 
         if (hasRRule && e.rrule) {
           // Generoi kaikki esiintymät ikkunaan
-          // Huom: kolmas parametri 'inc' = true, sisällytetään rajahetket
           const occurrences = e.rrule.between(windowStart, windowEnd, true);
 
           for (let occ of occurrences) {
@@ -156,23 +284,36 @@ export default async function handler(req, res) {
 
             const name = sourceForFields.summary || e.summary || "";
             const visibleName = stripPrefix(name);
-            const { eventType, subType } = classify(visibleName);
+            const cls = classify(visibleName);
 
             // Tyyppisuodatus
-            if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
-            if (tyyppi === "muut" && eventType !== "muu") continue;
+            if (tyyppi === "ottelut" && cls.eventType !== "ottelu") continue;
+            if (tyyppi === "muut" && cls.eventType !== "muu") continue;
 
-            allItems.push({
+            const baseRow = {
               alkuDate: start,
               alku: start.toISOString(),
               nimi: name,
               visibleName,
               kuvaus: sourceForFields.description || e.description || "",
               sijainti: sourceForFields.location || e.location || "",
-              eventType,
-              subType,
+              eventType: cls.eventType,
+              subType: cls.subType,
               isRecurring: true,
-            });
+            };
+
+            // Rikasta otteluille
+            if (cls.eventType === "ottelu" && cls.parsed) {
+              allItems.push({
+                ...baseRow,
+                home_team_name: cls.parsed.home_team_name,
+                away_team_name: cls.parsed.away_team_name,
+                home_is_ours: cls.parsed.home_is_ours,
+                opponent_team_name: cls.parsed.opponent_team_name,
+              });
+            } else {
+              allItems.push(baseRow);
+            }
           }
         } else {
           // Ei toistuva: lisää jos on ikkunassa
@@ -183,22 +324,34 @@ export default async function handler(req, res) {
 
           const name = e.summary || "";
           const visibleName = stripPrefix(name);
-          const { eventType, subType } = classify(visibleName);
+          const cls = classify(visibleName);
 
-          if (tyyppi === "ottelut" && eventType !== "ottelu") continue;
-          if (tyyppi === "muut" && eventType !== "muu") continue;
+          if (tyyppi === "ottelut" && cls.eventType !== "ottelu") continue;
+          if (tyyppi === "muut" && cls.eventType !== "muu") continue;
 
-          allItems.push({
+          const baseRow = {
             alkuDate: start,
             alku: start.toISOString(),
             nimi: name,
             visibleName,
             kuvaus: e.description || "",
             sijainti: e.location || "",
-            eventType,
-            subType,
+            eventType: cls.eventType,
+            subType: cls.subType,
             isRecurring: false,
-          });
+          };
+
+          if (cls.eventType === "ottelu" && cls.parsed) {
+            allItems.push({
+              ...baseRow,
+              home_team_name: cls.parsed.home_team_name,
+              away_team_name: cls.parsed.away_team_name,
+              home_is_ours: cls.parsed.home_is_ours,
+              opponent_team_name: cls.parsed.opponent_team_name,
+            });
+          } else {
+            allItems.push(baseRow);
+          }
         }
       }
     }
